@@ -1,0 +1,29 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "Debug",
+            "servertype": "openocd",
+            "cwd": "${workspaceRoot}",
+            "preLaunchTask": "Build binary",
+            "runToEntryPoint": "main",
+            "executable": "${workspaceFolder}/target/thumbv7em-none-eabihf/release/slcan",
+            "device": "STM32F446ZET6",
+            "configFiles": ["board/st_nucleo_f4.cfg"],
+            "svdFile": "${workspaceFolder}/.vscode/STM32F446.svd",
+            "preLaunchCommands": [
+                "monitor init",
+                "monitor reset init",
+                "monitor halt",
+                "monitor flash write_image erase ./target/thumbv7em-none-eabihf/release/slcan.bin 0x08000000"
+            ],
+            "postLaunchCommands": ["continue"], // Don't stop before the first line,
+            "showDevDebugOutput": "raw",
+        }
+    ]
+}
