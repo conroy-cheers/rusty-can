@@ -2,10 +2,11 @@
 #![no_std]
 
 use panic_halt as _;
+mod slcan;
 
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [USART1])]
 mod app {
-    use heapless::mpmc::Q32;
+    use crate::slcan::SLCAN;
     use stm32f4xx_hal::{
         gpio::{Output, AF7, PB0, PB14, PB7, PD8, PD9},
         pac,
@@ -17,12 +18,13 @@ mod app {
 
     type RxType = Rx<pac::USART3, u8>;
     type TxType = Tx<pac::USART3, u8>;
-    type QueueType = Q32<u8>;
 
     #[shared]
     struct Shared {
         #[lock_free]
-        queue: QueueType,
+        tx_queue: crate::slcan::QueueType,
+        #[lock_free]
+        rx_queue: crate::slcan::QueueType,
     }
 
     #[local]
@@ -30,6 +32,7 @@ mod app {
         led_green: PB0<Output>,
         led_blue: PB7<Output>,
         led_red: PB14<Output>,
+        slcan: SLCAN,
         rx: RxType,
         tx: TxType,
     }
@@ -68,14 +71,18 @@ mod app {
         let (tx, mut rx) = serial.split();
         rx.listen();
 
-        let queue = QueueType::new();
+        let tx_queue = crate::slcan::QueueType::new();
+        let rx_queue = crate::slcan::QueueType::new();
+
+        let slcan = SLCAN::new();
 
         (
-            Shared { queue },
+            Shared { tx_queue, rx_queue },
             Local {
                 led_green,
                 led_blue,
                 led_red,
+                slcan,
                 rx,
                 tx,
             },
@@ -88,21 +95,21 @@ mod app {
         loop {}
     }
 
-    #[task(shared=[queue], local=[led_green, led_blue, tx])]
+    #[task(shared=[tx_queue], local=[led_green, led_blue, tx])]
     fn tick(ctx: tick::Context) {
         ctx.local.led_green.toggle();
-
-        if let Some(to_send) = ctx.shared.queue.dequeue() {
+        // send all contents of the tx queue
+        while let Some(to_send) = ctx.shared.tx_queue.pop_back() {
             serial_write(ctx.local.tx, ctx.local.led_blue, to_send);
         }
         tick::spawn_after(500.millis()).ok();
     }
 
-    #[task(binds=USART3, shared=[queue], local=[led_red, rx])]
+    #[task(binds=USART3, shared=[tx_queue, rx_queue], local=[led_red, rx, slcan])]
     fn serial(ctx: serial::Context) {
         match ctx.local.rx.read() {
             Ok(c) => {
-                ctx.shared.queue.enqueue(c).unwrap();
+                ctx.local.slcan.handle_incoming_byte(c, ctx.shared.rx_queue).unwrap();
             }
             Err(_e) => {
                 ctx.local.led_red.set_high();
