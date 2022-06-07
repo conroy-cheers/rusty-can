@@ -109,12 +109,30 @@ mod app {
     fn serial(ctx: serial::Context) {
         match ctx.local.rx.read() {
             Ok(c) => {
-                ctx.local.slcan.handle_incoming_byte(c, ctx.shared.rx_queue).unwrap();
+                match ctx.local.slcan.handle_incoming_byte(c, ctx.shared.rx_queue) {
+                    Ok(c) => {
+                        if c.is_some() {
+                            // Handle command
+                            match c.unwrap().run() {
+                                Ok(command_output) => {
+                                    tx_queue_push(ctx.shared.tx_queue, &command_output)
+                                }
+                                Err(_e) => ctx.local.led_red.set_high(),
+                            }
+                        }
+                    }
+                    Err(_e) => ctx.local.led_red.set_high(),
+                }
             }
-            Err(_e) => {
-                ctx.local.led_red.set_high();
-            }
+            Err(_e) => ctx.local.led_red.set_high(),
         }
+    }
+
+    fn tx_queue_push(queue: &mut crate::slcan::QueueType, output: &crate::slcan::ResponseData) {
+        for b in output.iter() {
+            queue.push_front(*b).unwrap();
+        }
+        queue.push_front(crate::slcan::COMMAND_TERMINATOR).unwrap();
     }
 
     fn serial_write(tx: &mut TxType, led: &mut PB7<Output>, data: u8) {

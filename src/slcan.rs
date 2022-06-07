@@ -21,7 +21,7 @@ pub struct QueueFullError;
 #[derive(Debug, Clone)]
 pub struct InvalidCommandError;
 
-const command_terminator: u8 = b'\r';
+pub const COMMAND_TERMINATOR: u8 = b'\r';
 
 pub type QueueType = heapless::Deque<u8, 32>;
 pub type CommandQueueType = heapless::Deque<Command, 8>;
@@ -82,7 +82,7 @@ impl SLCAN {
         rx_queue: &mut QueueType,
     ) -> Result<Option<Command>, SLCANError> {
         // If we received a command terminator, attempt to parse the rx queue as a single command
-        if incoming_byte == command_terminator {
+        if incoming_byte == COMMAND_TERMINATOR {
             let received_bytes: RequestData = rx_queue.iter().map(|&x| x).collect();
             let command = Command::from_bytes(&received_bytes);
             return Some(command).transpose();
@@ -126,8 +126,8 @@ pub struct Command {
 }
 
 type RequestData = heapless::Vec<u8, 32>;
-type ResponseData = heapless::Vec<u8, 12>;
-type CommandReturnType = Result<ResponseData, SLCANError>;
+pub type ResponseData = heapless::Vec<u8, 12>;
+pub type CommandReturnType = Result<ResponseData, SLCANError>;
 
 impl Command {
     /// Parses a Command from bytes. Variant identifier is checked here,
@@ -220,7 +220,7 @@ impl Command {
 
     fn run_get_serial_number(&self) -> CommandReturnType {
         // return serial number
-        Ok(ResponseData::new())
+        Ok(ResponseData::from_slice(b"1234").unwrap())
     }
 
     fn run_enable_timestamps(&self) -> CommandReturnType {
