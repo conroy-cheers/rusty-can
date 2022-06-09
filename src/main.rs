@@ -1,7 +1,9 @@
 #![no_main]
 #![no_std]
+#![feature(generic_const_exprs)]
 
 use panic_halt as _;
+mod canbus;
 mod slcan;
 
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [USART1])]
@@ -107,32 +109,28 @@ mod app {
 
     #[task(binds=USART3, shared=[tx_queue, rx_queue], local=[led_red, rx, slcan])]
     fn serial(ctx: serial::Context) {
-        match ctx.local.rx.read() {
-            Ok(c) => {
-                match ctx.local.slcan.handle_incoming_byte(c, ctx.shared.rx_queue) {
-                    Ok(c) => {
-                        if c.is_some() {
-                            // Handle command
-                            match c.unwrap().run() {
-                                Ok(command_output) => {
-                                    tx_queue_push(ctx.shared.tx_queue, &command_output)
-                                }
-                                Err(_e) => ctx.local.led_red.set_high(),
-                            }
-                        }
-                    }
-                    Err(_e) => ctx.local.led_red.set_high(),
+        let read_byte = ctx.local.rx.read().unwrap();
+        match ctx
+            .local
+            .slcan
+            .handle_incoming_byte(read_byte, ctx.shared.rx_queue)
+        {
+            Ok(cmd) => {
+                if cmd.is_some() {
+                    // Handle command
+                    let cmd_output = cmd.unwrap().run(ctx.local.slcan);
+                    // panic if buffer full
+                    ctx.local
+                        .slcan
+                        .handle_command_output(&cmd_output, ctx.shared.tx_queue)
+                        .unwrap();
                 }
             }
-            Err(_e) => ctx.local.led_red.set_high(),
+            Err(_e) => {
+                // Invalid command
+                ctx.local.led_red.set_high()
+            }
         }
-    }
-
-    fn tx_queue_push(queue: &mut crate::slcan::QueueType, output: &crate::slcan::ResponseData) {
-        for b in output.iter() {
-            queue.push_front(*b).unwrap();
-        }
-        queue.push_front(crate::slcan::COMMAND_TERMINATOR).unwrap();
     }
 
     fn serial_write(tx: &mut TxType, led: &mut PB7<Output>, data: u8) {
