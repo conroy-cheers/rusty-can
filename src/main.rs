@@ -8,9 +8,11 @@ mod slcan;
 
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [USART1])]
 mod app {
+    use crate::canbus::{CANBitrate, CANBus};
     use crate::slcan::SLCAN;
     use stm32f4xx_hal::{
-        gpio::{Output, AF7, PB0, PB14, PB7, PD8, PD9},
+        can::Can,
+        gpio::{Output, AF7, AF9, PB0, PB14, PB7, PD0, PD1, PD8, PD9},
         pac,
         prelude::*,
         rcc::RccExt,
@@ -37,6 +39,7 @@ mod app {
         slcan: SLCAN,
         rx: RxType,
         tx: TxType,
+        can: CANBus<Can<pac::CAN1, (PD1<AF9>, PD0<AF9>)>>,
     }
 
     #[monotonic(binds = TIM2, default = true)]
@@ -48,7 +51,7 @@ mod app {
         let gpiod = ctx.device.GPIOD.split();
 
         let rcc = ctx.device.RCC.constrain();
-        let clocks = rcc.cfgr.sysclk(48_u32.MHz()).freeze();
+        let clocks = rcc.cfgr.use_hse(8.MHz()).freeze();
 
         let led_green = gpiob.pb0.into_push_pull_output();
         let led_blue = gpiob.pb7.into_push_pull_output();
@@ -56,6 +59,18 @@ mod app {
 
         let mono = ctx.device.TIM2.monotonic_us(&clocks);
         tick::spawn().ok();
+
+        let mut can = {
+            let rx_pin: PD0<AF9> = gpiod.pd0.into_alternate();
+            let tx_pin: PD1<AF9> = gpiod.pd1.into_alternate();
+
+            let can = ctx.device.CAN1.can((tx_pin, rx_pin));
+            CANBus::new(can)
+        };
+        can.set_bitrate(CANBitrate::Bitrate125k)
+            .unwrap();
+
+        tick_can::spawn().ok();
 
         let tx_pin: PD8<AF7> = gpiod.pd8.into_alternate();
         let rx_pin: PD9<AF7> = gpiod.pd9.into_alternate();
@@ -87,6 +102,7 @@ mod app {
                 slcan,
                 rx,
                 tx,
+                can,
             },
             init::Monotonics(mono),
         )
@@ -97,7 +113,7 @@ mod app {
         loop {}
     }
 
-    #[task(shared=[tx_queue], local=[led_green, led_blue, tx])]
+    #[task(priority=2, shared=[tx_queue], local=[led_green, led_blue, tx])]
     fn tick(ctx: tick::Context) {
         ctx.local.led_green.toggle();
         // send all contents of the tx queue
@@ -107,7 +123,20 @@ mod app {
         tick::spawn_after(500.millis()).ok();
     }
 
-    #[task(binds=USART3, shared=[tx_queue, rx_queue], local=[led_red, rx, slcan])]
+    #[task(priority=2, local=[led_red, can])]
+    fn tick_can(ctx: tick_can::Context) {
+        match ctx.local.can.receive() {
+            Ok(_frame) => {
+                ctx.local.led_red.set_low();
+            }
+            Err(_e) => {
+                ctx.local.led_red.set_high();
+            }
+        }
+        tick_can::spawn_after(100.millis()).ok();
+    }
+
+    #[task(priority=2, binds=USART3, shared=[tx_queue, rx_queue], local=[rx, slcan])]
     fn serial(ctx: serial::Context) {
         let read_byte = ctx.local.rx.read().unwrap();
         match ctx
@@ -128,7 +157,7 @@ mod app {
             }
             Err(_e) => {
                 // Invalid command
-                ctx.local.led_red.set_high()
+                // ctx.local.led_red.set_high()
             }
         }
     }

@@ -72,10 +72,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "bxcan"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b13b4b2ea9ab2ba924063ebb86ad895cb79f4a79bf90f27949eb20c335b30f9"
+dependencies = [
+ "bitflags",
+ "nb 1.0.0",
+ "vcell",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14c189c53d098945499cdfa7ecc63567cf3886b3332b312a5b4585d8d3a6a610"
+
+[[package]]
+name = "can-bit-timings"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e1b1ce3e608c8cd4f702018991a7b038fc7d3cab7240c26134e41ac80e6392c"
+dependencies = [
+ "can-bit-timings-core",
+ "can-bit-timings-proc-macro",
+]
+
+[[package]]
+name = "can-bit-timings-core"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e208af7b3d79867ff9730c5af87f28bca496b6da5aced8cfac1cd5863b993604"
+
+[[package]]
+name = "can-bit-timings-proc-macro"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd4fcfc219e5beba7338a63fb54e2f2aa1712c6e6a12d9f7f290342ab8c7168f"
+dependencies = [
+ "can-bit-timings-core",
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "cfg-if"
@@ -499,6 +539,8 @@ dependencies = [
 name = "rusty-can"
 version = "0.1.0"
 dependencies = [
+ "bxcan",
+ "can-bit-timings",
  "cortex-m",
  "cortex-m-rt",
  "cortex-m-rtic",
@@ -574,6 +616,7 @@ checksum = "23ff737e5c7bd48ed40b5e14f1da1413c34be611c9871779199b67c40f40a396"
 dependencies = [
  "bare-metal 1.0.0",
  "bitflags",
+ "bxcan",
  "cortex-m",
  "cortex-m-rt",
  "embedded-dma",
