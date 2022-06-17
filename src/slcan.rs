@@ -1,7 +1,8 @@
 mod util;
 
-use crate::canbus::CANBitrate;
+use crate::canbus::{CANBitrate, CANBus};
 use crate::slcan::util::{concat, BoundedU8};
+use bxcan::{ExtendedId, StandardId};
 use heapless;
 use hex;
 use packed_struct::prelude::*;
@@ -20,6 +21,8 @@ pub enum ErrorKind {
     QueueFull,
     InvalidCommand,
     NotImplemented,
+    CANError,
+    BufferOverrun,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +34,7 @@ pub struct InvalidCommandError;
 pub const COMMAND_TERMINATOR: u8 = b'\r';
 pub const ERROR_CHAR: u8 = 7;
 
-pub type QueueType = heapless::Deque<u8, 32>;
+pub type QueueType = heapless::Deque<u8, 64>;
 pub type CommandQueueType = heapless::Deque<Command, 8>;
 
 trait HexOutput<const N: usize> {
@@ -42,6 +45,26 @@ trait HexOutput<const N: usize> {
         hex::encode_to_slice(self.as_bytes(), &mut hex_str).unwrap();
         hex_str.make_ascii_uppercase();
         return hex_str;
+    }
+
+    fn push_to_queue(&self, queue: &mut QueueType) -> Result<[u8; N * 2], u8> {
+        let hex_str = self.as_hex();
+        for byte in hex_str {
+            queue.push_front(byte)?;
+        }
+        Ok(hex_str)
+    }
+}
+
+impl HexOutput<2> for StandardId {
+    fn as_bytes(&self) -> [u8; 2] {
+        self.as_raw().to_be_bytes()
+    }
+}
+
+impl HexOutput<4> for ExtendedId {
+    fn as_bytes(&self) -> [u8; 4] {
+        self.as_raw().to_be_bytes()
     }
 }
 
@@ -186,6 +209,46 @@ impl SLCAN {
         }
         Ok(())
     }
+
+    pub fn handle_incoming_can_frame(
+        frame: &bxcan::Frame,
+        tx_queue: &mut QueueType,
+    ) -> Result<(), SLCANError> {
+        SLCAN::can_frame_representation(frame, tx_queue)
+            .map_err(|_e| -> SLCANError { SLCANError::Regular(ErrorKind::BufferOverrun) })
+    }
+
+    fn can_frame_representation(frame: &bxcan::Frame, queue: &mut QueueType) -> Result<(), u8> {
+        match frame.id() {
+            bxcan::Id::Standard(id) => {
+                queue.push_front(b't')?;
+                id.push_to_queue(queue)?;
+            }
+            bxcan::Id::Extended(id) => {
+                queue.push_front(b'T')?;
+                id.push_to_queue(queue)?;
+            }
+        }
+        match frame.data() {
+            Some(data) => {
+                let len_char = char::from_digit(data.len() as u32, 10).unwrap();
+                queue.push_front(len_char as u8)?;
+
+                for i in 0..data.len() {
+                    let mut hex_str = [0u8; 2];
+                    hex::encode_to_slice([data[i]], &mut hex_str).unwrap();
+                    hex_str.make_ascii_uppercase();
+                    for byte in hex_str {
+                        queue.push_front(byte)?;
+                    }
+                }
+
+                // TODO send timestamps
+            }
+            None => {}
+        }
+        Ok(())
+    }
 }
 
 type LengthType = BoundedU8<0, 8>;
@@ -248,12 +311,15 @@ impl Command {
     }
 
     /// Runs the command, returning any bytes to be sent back over serial.
-    pub fn run(&self, slcan: &mut SLCAN) -> CommandReturnType {
+    pub fn run<I>(&self, slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    where
+        I: bxcan::FilterOwner,
+    {
         match self.variant {
-            CommandVariant::Setup => self.run_setup(slcan),
+            CommandVariant::Setup => self.run_setup(slcan, canbus),
             CommandVariant::SetupWithBTR => self.run_not_implemented(slcan),
-            CommandVariant::OpenChannel => self.run_open_channel(slcan),
-            CommandVariant::CloseChannel => self.run_close_channel(slcan),
+            CommandVariant::OpenChannel => self.run_open_channel(slcan, canbus),
+            CommandVariant::CloseChannel => self.run_close_channel(slcan, canbus),
             CommandVariant::TransmitFrame => self.run_transmit_frame(slcan),
             CommandVariant::TransmitExtendedFrame => self.run_transmit_extended_frame(slcan),
             CommandVariant::TransmitRTRFrame => self.run_not_implemented(slcan),
@@ -272,18 +338,44 @@ impl Command {
         Err(SLCANError::Regular(ErrorKind::NotImplemented))
     }
 
-    fn run_setup(&self, slcan: &mut SLCAN) -> CommandReturnType {
-        // do some setup things
+    fn run_setup<I>(&self, slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    where
+        I: bxcan::FilterOwner,
+    {
+        // set CAN bitrate
+        let bitrate = match self.data.get(0) {
+            Some(b'0') => CANBitrate::Bitrate10k,
+            Some(b'1') => CANBitrate::Bitrate20k,
+            Some(b'2') => CANBitrate::Bitrate50k,
+            Some(b'3') => CANBitrate::Bitrate100k,
+            Some(b'4') => CANBitrate::Bitrate125k,
+            Some(b'5') => CANBitrate::Bitrate250k,
+            Some(b'6') => CANBitrate::Bitrate500k,
+            Some(b'7') => CANBitrate::Bitrate800k,
+            Some(b'8') => CANBitrate::Bitrate1M,
+            _ => return Err(SLCANError::Regular(ErrorKind::InvalidCommand)),
+        };
+        canbus
+            .set_bitrate(bitrate)
+            .map_err(|_e| SLCANError::Regular(ErrorKind::CANError))?;
         Ok(ResponseData::new())
     }
 
-    fn run_open_channel(&self, slcan: &mut SLCAN) -> CommandReturnType {
+    fn run_open_channel<I>(&self, slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    where
+        I: bxcan::FilterOwner,
+    {
         // open the CAN channel
+        canbus.enable();
         Ok(ResponseData::new())
     }
 
-    fn run_close_channel(&self, slcan: &mut SLCAN) -> CommandReturnType {
+    fn run_close_channel<I>(&self, slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    where
+        I: bxcan::FilterOwner,
+    {
         // close the CAN channel
+        canbus.disable();
         Ok(ResponseData::new())
     }
 
@@ -326,57 +418,6 @@ impl Command {
             _ => return Err(SLCANError::Regular(ErrorKind::InvalidCommand)),
         }
     }
-}
-
-struct Setup {
-    can_bitrate: CANBitrate,
-}
-
-struct SetupWithBTR {
-    btr0: u8,
-    btr1: u8,
-}
-
-struct OpenChannel;
-
-struct CloseChannel;
-
-struct TransmitFrame {
-    id: StandardID,
-    data: heapless::Vec<u8, 8>,
-}
-
-struct TransmitExtendedFrame {
-    id: ExtendedID,
-    data: heapless::Vec<u8, 8>,
-}
-
-struct TransmitRTRFrame {
-    id: StandardID,
-    length: LengthType,
-}
-
-struct TransmitExtendedRTRFrame {
-    id: ExtendedID,
-    length: LengthType,
-}
-
-struct ReadStatusFlags;
-
-struct SetAcceptanceCode {
-    acceptance_code: heapless::Vec<u8, 4>,
-}
-
-struct SetAcceptanceMask {
-    acceptance_mask: heapless::Vec<u8, 4>,
-}
-
-struct GetVersion;
-
-struct GetSerialNumber;
-
-struct EnableTimeStamps {
-    enable_timestamps: bool,
 }
 
 // ****** end of command structs ******

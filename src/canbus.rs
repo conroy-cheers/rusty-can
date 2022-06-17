@@ -27,14 +27,14 @@ pub enum CANBitrate {
 
 pub struct CANBus<I>
 where
-    I: bxcan::Instance,
+    I: bxcan::FilterOwner,
 {
     can_instance: bxcan::Can<I>,
 }
 
 impl<I> CANBus<I>
 where
-    I: bxcan::Instance + bxcan::FilterOwner,
+    I: bxcan::FilterOwner,
 {
     pub fn new(can: I) -> Self {
         let mut bxcan = bxcan::Can::builder(can).leave_disabled();
@@ -60,9 +60,17 @@ where
         let timings = CANBus::<I>::get_bit_timings(bitrate)?;
 
         let config = self.can_instance.modify_config();
-        config.set_bit_timing(timings).enable();
+        config.set_bit_timing(timings).leave_disabled();
 
         Ok(())
+    }
+
+    pub fn enable(&mut self) {
+        self.can_instance.modify_config().enable();
+    }
+
+    pub fn disable(&mut self) {
+        self.can_instance.modify_config().leave_disabled();
     }
 
     fn get_bit_timings(bitrate: CANBitrate) -> Result<u32, CANError> {
