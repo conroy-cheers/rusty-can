@@ -1,7 +1,7 @@
 mod util;
 
 use crate::canbus::{CANBitrate, CANBus};
-use crate::slcan::util::{concat, BoundedU8};
+use crate::slcan::util::concat;
 use bxcan::{ExtendedId, StandardId};
 use heapless;
 use hex;
@@ -34,8 +34,7 @@ pub struct InvalidCommandError;
 pub const COMMAND_TERMINATOR: u8 = b'\r';
 pub const ERROR_CHAR: u8 = 7;
 
-pub type QueueType = heapless::Deque<u8, 64>;
-pub type CommandQueueType = heapless::Deque<Command, 8>;
+pub type QueueType = heapless::Deque<u8, 128>;
 
 trait HexOutput<const N: usize> {
     fn as_bytes(&self) -> [u8; N];
@@ -50,7 +49,7 @@ trait HexOutput<const N: usize> {
     fn push_to_queue(&self, queue: &mut QueueType) -> Result<[u8; N * 2], u8> {
         let hex_str = self.as_hex();
         for byte in hex_str {
-            queue.push_front(byte)?;
+            queue.push_back(byte)?;
         }
         Ok(hex_str)
     }
@@ -59,6 +58,14 @@ trait HexOutput<const N: usize> {
 impl HexOutput<2> for StandardId {
     fn as_bytes(&self) -> [u8; 2] {
         self.as_raw().to_be_bytes()
+    }
+
+    fn push_to_queue(&self, queue: &mut QueueType) -> Result<[u8; 4], u8> {
+        let hex_str = self.as_hex();
+        for byte in &hex_str[1..] {
+            queue.push_back(*byte)?;
+        }
+        Ok(hex_str)
     }
 }
 
@@ -102,11 +109,6 @@ impl HexOutput<1> for StatusFlags {
     }
 }
 
-enum CANChannelState {
-    Open,
-    Closed,
-}
-
 struct VersionInfo {
     hardware_version: u8,
     software_version: u8,
@@ -119,9 +121,7 @@ impl HexOutput<2> for VersionInfo {
 }
 
 pub struct SLCAN {
-    command_queue: CommandQueueType,
-    channel_state: CANChannelState,
-    bitrate: Option<CANBitrate>,
+    pub bitrate: Option<CANBitrate>,
     timestamps_enabled: bool,
     status: StatusFlags,
     version: VersionInfo,
@@ -131,8 +131,6 @@ pub struct SLCAN {
 impl SLCAN {
     pub fn new() -> Self {
         SLCAN {
-            command_queue: CommandQueueType::new(),
-            channel_state: CANChannelState::Closed,
             bitrate: None,
             timestamps_enabled: false,
             status: StatusFlags::new(),
@@ -152,8 +150,15 @@ impl SLCAN {
         rx_queue: &mut QueueType,
     ) -> Result<Option<Command>, SLCANError> {
         let result = self.do_handle_incoming_byte(incoming_byte, rx_queue);
-        if result.is_err() {
-            self.status.receive_queue_full = true;
+        match &result {
+            Err(SLCANError::Regular(kind)) => match kind {
+                ErrorKind::QueueFull => self.status.receive_queue_full = true,
+                ErrorKind::InvalidCommand => self.status.error_passive = true,
+                ErrorKind::NotImplemented => self.status.error_passive = true,
+                ErrorKind::CANError => self.status.bus_error = true,
+                ErrorKind::BufferOverrun => self.status.transmit_queue_full = true,
+            },
+            Ok(_c) => {}
         }
         return result;
     }
@@ -172,7 +177,7 @@ impl SLCAN {
         }
 
         // Otherwise, just push to the queue
-        rx_queue.push_front(incoming_byte).map_err(err_queue_full)?;
+        rx_queue.push_back(incoming_byte).map_err(err_queue_full)?;
         return Ok(None);
     }
 
@@ -199,12 +204,12 @@ impl SLCAN {
         match output {
             Ok(data) => {
                 for b in data.iter() {
-                    tx_queue.push_front(*b)?;
+                    tx_queue.push_back(*b)?;
                 }
-                tx_queue.push_front(crate::slcan::COMMAND_TERMINATOR)?;
+                tx_queue.push_back(crate::slcan::COMMAND_TERMINATOR)?;
             }
             Err(_e) => {
-                tx_queue.push_front(crate::slcan::ERROR_CHAR)?;
+                tx_queue.push_back(crate::slcan::ERROR_CHAR)?;
             }
         }
         Ok(())
@@ -221,25 +226,25 @@ impl SLCAN {
     fn can_frame_representation(frame: &bxcan::Frame, queue: &mut QueueType) -> Result<(), u8> {
         match frame.id() {
             bxcan::Id::Standard(id) => {
-                queue.push_front(b't')?;
+                queue.push_back(b't')?;
                 id.push_to_queue(queue)?;
             }
             bxcan::Id::Extended(id) => {
-                queue.push_front(b'T')?;
+                queue.push_back(b'T')?;
                 id.push_to_queue(queue)?;
             }
         }
         match frame.data() {
             Some(data) => {
                 let len_char = char::from_digit(data.len() as u32, 10).unwrap();
-                queue.push_front(len_char as u8)?;
+                queue.push_back(len_char as u8)?;
 
                 for i in 0..data.len() {
                     let mut hex_str = [0u8; 2];
                     hex::encode_to_slice([data[i]], &mut hex_str).unwrap();
                     hex_str.make_ascii_uppercase();
                     for byte in hex_str {
-                        queue.push_front(byte)?;
+                        queue.push_back(byte)?;
                     }
                 }
 
@@ -247,11 +252,10 @@ impl SLCAN {
             }
             None => {}
         }
+        queue.push_back(COMMAND_TERMINATOR)?;
         Ok(())
     }
 }
-
-type LengthType = BoundedU8<0, 8>;
 
 enum CommandVariant {
     Setup,
@@ -273,10 +277,10 @@ enum CommandVariant {
 /// Data container for an SLCAN command
 pub struct Command {
     variant: CommandVariant,
-    data: heapless::Vec<u8, 12>,
+    data: heapless::Vec<u8, 16>,
 }
 
-type RequestData = heapless::Vec<u8, 32>;
+type RequestData = heapless::Vec<u8, 12>;
 pub type ResponseData = heapless::Vec<u8, 12>;
 pub type CommandReturnType = Result<ResponseData, SLCANError>;
 
@@ -358,10 +362,11 @@ impl Command {
         canbus
             .set_bitrate(bitrate)
             .map_err(|_e| SLCANError::Regular(ErrorKind::CANError))?;
+        slcan.bitrate = Some(bitrate);
         Ok(ResponseData::new())
     }
 
-    fn run_open_channel<I>(&self, slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    fn run_open_channel<I>(&self, _slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
     where
         I: bxcan::FilterOwner,
     {
@@ -370,7 +375,7 @@ impl Command {
         Ok(ResponseData::new())
     }
 
-    fn run_close_channel<I>(&self, slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    fn run_close_channel<I>(&self, _slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
     where
         I: bxcan::FilterOwner,
     {
@@ -379,12 +384,12 @@ impl Command {
         Ok(ResponseData::new())
     }
 
-    fn run_transmit_frame(&self, slcan: &mut SLCAN) -> CommandReturnType {
+    fn run_transmit_frame(&self, _slcan: &mut SLCAN) -> CommandReturnType {
         // transmit a frame
         Ok(ResponseData::new())
     }
 
-    fn run_transmit_extended_frame(&self, slcan: &mut SLCAN) -> CommandReturnType {
+    fn run_transmit_extended_frame(&self, _slcan: &mut SLCAN) -> CommandReturnType {
         // transmit an extended frame
         Ok(ResponseData::new())
     }
@@ -418,16 +423,4 @@ impl Command {
             _ => return Err(SLCANError::Regular(ErrorKind::InvalidCommand)),
         }
     }
-}
-
-// ****** end of command structs ******
-
-struct StandardID {
-    // 11-bit identifier
-    id: u16,
-}
-
-struct ExtendedID {
-    // 29-bit identifier
-    id: u32,
 }

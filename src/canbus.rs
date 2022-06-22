@@ -13,6 +13,7 @@ pub enum ErrorKind {
     BufferOverrun,
 }
 
+#[derive(Clone, Copy)]
 pub enum CANBitrate {
     Bitrate10k,
     Bitrate20k,
@@ -30,6 +31,7 @@ where
     I: bxcan::FilterOwner,
 {
     can_instance: bxcan::Can<I>,
+    enabled: bool,
 }
 
 impl<I> CANBus<I>
@@ -44,6 +46,7 @@ where
 
         CANBus {
             can_instance: bxcan,
+            enabled: false,
         }
     }
 
@@ -52,24 +55,31 @@ where
     }
 
     pub fn receive(&mut self) -> Result<Frame, CANError> {
-        block!(self.can_instance.receive())
-            .map_err(|()| -> CANError { CANError::Regular(ErrorKind::BufferOverrun) })
+        self.can_instance.receive()
+            .map_err(|_| -> CANError { CANError::Regular(ErrorKind::BufferOverrun) })
     }
 
     pub fn set_bitrate(&mut self, bitrate: CANBitrate) -> Result<(), CANError> {
         let timings = CANBus::<I>::get_bit_timings(bitrate)?;
 
+        self.enabled = false;
         let config = self.can_instance.modify_config();
         config.set_bit_timing(timings).leave_disabled();
 
         Ok(())
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn enable(&mut self) {
         self.can_instance.modify_config().enable();
+        self.enabled = true;
     }
 
     pub fn disable(&mut self) {
+        self.enabled = false;
         self.can_instance.modify_config().leave_disabled();
     }
 
