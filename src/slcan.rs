@@ -16,6 +16,10 @@ pub fn err_queue_full(_e: u8) -> SLCANError {
     SLCANError::Regular(ErrorKind::QueueFull)
 }
 
+fn err_invalid_command(_e: hex::FromHexError) -> SLCANError {
+    SLCANError::Regular(ErrorKind::InvalidCommand)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ErrorKind {
     QueueFull,
@@ -27,9 +31,6 @@ pub enum ErrorKind {
 
 #[derive(Debug, Clone)]
 pub struct QueueFullError;
-
-#[derive(Debug, Clone)]
-pub struct InvalidCommandError;
 
 pub const COMMAND_TERMINATOR: u8 = b'\r';
 pub const ERROR_CHAR: u8 = 7;
@@ -219,41 +220,69 @@ impl SLCAN {
         frame: &bxcan::Frame,
         tx_queue: &mut QueueType,
     ) -> Result<(), SLCANError> {
-        SLCAN::can_frame_representation(frame, tx_queue)
-            .map_err(|_e| -> SLCANError { SLCANError::Regular(ErrorKind::BufferOverrun) })
+        let repr = SLCAN::can_frame_representation(frame, true);
+
+        let available = tx_queue.capacity() - tx_queue.len();
+        // need 1 extra space for terminator
+        if repr.len() >= available {
+            return Err(SLCANError::Regular(ErrorKind::BufferOverrun));
+        }
+        
+        for byte in repr {
+            tx_queue.push_back(byte).unwrap();
+        }
+        tx_queue.push_back(COMMAND_TERMINATOR).unwrap();
+
+        Ok(())
     }
 
-    fn can_frame_representation(frame: &bxcan::Frame, queue: &mut QueueType) -> Result<(), u8> {
+    fn can_frame_representation(
+        frame: &bxcan::Frame,
+        include_start_byte: bool,
+    ) -> heapless::Vec<u8, 24> {
+        let mut rep = heapless::Vec::<u8, 24>::new();
+
+        if include_start_byte {
+            let start_byte = match frame.id() {
+                bxcan::Id::Standard(_id) => b"t",
+                bxcan::Id::Extended(_id) => b"T",
+            };
+            rep.extend_from_slice(start_byte).unwrap();
+        }
+
         match frame.id() {
             bxcan::Id::Standard(id) => {
-                queue.push_back(b't')?;
-                id.push_to_queue(queue)?;
+                rep.extend_from_slice(&id.as_hex()[1..]).unwrap();
             }
             bxcan::Id::Extended(id) => {
-                queue.push_back(b'T')?;
-                id.push_to_queue(queue)?;
+                rep.extend_from_slice(&id.as_hex()).unwrap();
             }
         }
+
         match frame.data() {
             Some(data) => {
-                let len_char = char::from_digit(data.len() as u32, 10).unwrap();
-                queue.push_back(len_char as u8)?;
+                let data_len: u8 = char::from_digit(data.len() as u32, 10).unwrap() as u8;
+                rep.extend_from_slice(&[data_len]).unwrap();
 
+                let mut data_str = heapless::Vec::<u8, 16>::new();
                 for i in 0..data.len() {
                     let mut hex_str = [0u8; 2];
                     hex::encode_to_slice([data[i]], &mut hex_str).unwrap();
                     hex_str.make_ascii_uppercase();
-                    for byte in hex_str {
-                        queue.push_back(byte)?;
-                    }
+
+                    data_str.extend_from_slice(&hex_str).unwrap();
                 }
+                rep.extend(data_str);
 
                 // TODO send timestamps
             }
-            None => {}
+            None => {
+                let data_len = b"0";
+                rep.extend_from_slice(data_len).unwrap();
+            }
         }
-        queue.push_back(COMMAND_TERMINATOR)?;
-        Ok(())
+
+        return rep;
     }
 }
 
@@ -277,11 +306,11 @@ enum CommandVariant {
 /// Data container for an SLCAN command
 pub struct Command {
     variant: CommandVariant,
-    data: heapless::Vec<u8, 16>,
+    data: heapless::Vec<u8, 32>,
 }
 
-type RequestData = heapless::Vec<u8, 12>;
-pub type ResponseData = heapless::Vec<u8, 12>;
+type RequestData = heapless::Vec<u8, 32>;
+pub type ResponseData = heapless::Vec<u8, 32>;
 pub type CommandReturnType = Result<ResponseData, SLCANError>;
 
 impl Command {
@@ -386,12 +415,63 @@ impl Command {
 
     fn run_transmit_frame(&self, _slcan: &mut SLCAN) -> CommandReturnType {
         // transmit a frame
-        Ok(ResponseData::new())
+        // frame must have minimum 4 bytes
+        if self.data.len() < 4 {
+            return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
+        }
+
+        let mut id = [0u8; 2];
+        hex::decode_to_slice(&self.data[1..4], &mut id).map_err(err_invalid_command)?;
+        let id = bxcan::StandardId::new(u16::from_be_bytes(id))
+            .ok_or(SLCANError::Regular(ErrorKind::InvalidCommand))?;
+
+        let mut data_len = [0u8; 1];
+        hex::decode_to_slice(&self.data[4..5], &mut data_len).map_err(err_invalid_command)?;
+        let data_len: usize = u8::from_be_bytes(data_len).into();
+
+        // ensure frame size is correct
+        let last_idx: usize = (4 + 2 * data_len).into();
+        if data_len > 8 || self.data.len() != last_idx {
+            return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
+        }
+
+        let mut data = [0u8; 8];
+        hex::decode_to_slice(&self.data[5..last_idx], &mut data).map_err(err_invalid_command)?;
+
+        let frame = bxcan::Frame::new_data(id, bxcan::Data::new(&data[..data_len]).unwrap());
+
+        let frame_bytes = SLCAN::can_frame_representation(&frame, true);
+        Ok(ResponseData::from_slice(frame_bytes.as_slice()).unwrap())
     }
 
     fn run_transmit_extended_frame(&self, _slcan: &mut SLCAN) -> CommandReturnType {
         // transmit an extended frame
-        Ok(ResponseData::new())
+        // frame must have minimum 9 bytes
+        if self.data.len() < 9 {
+            return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
+        }
+        let mut id = [0u8; 4];
+        hex::decode_to_slice(&self.data[1..9], &mut id).map_err(err_invalid_command)?;
+        let id = bxcan::ExtendedId::new(u32::from_be_bytes(id))
+            .ok_or(SLCANError::Regular(ErrorKind::InvalidCommand))?;
+
+        let mut data_len = [0u8; 1];
+        hex::decode_to_slice(&self.data[9..10], &mut data_len).map_err(err_invalid_command)?;
+        let data_len: usize = u8::from_be_bytes(data_len).into();
+
+        // ensure frame size is correct
+        let last_idx: usize = (9 + 2 * data_len).into();
+        if data_len > 8 || self.data.len() != last_idx {
+            return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
+        }
+
+        let mut data = [0u8; 8];
+        hex::decode_to_slice(&self.data[10..last_idx], &mut data).map_err(err_invalid_command)?;
+
+        let frame = bxcan::Frame::new_data(id, bxcan::Data::new(&data[..data_len]).unwrap());
+
+        let frame_bytes = SLCAN::can_frame_representation(&frame, true);
+        Ok(ResponseData::from_slice(frame_bytes.as_slice()).unwrap())
     }
 
     fn run_read_status_flags(&self, slcan: &mut SLCAN) -> CommandReturnType {
