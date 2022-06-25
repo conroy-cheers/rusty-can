@@ -1,6 +1,5 @@
 use bxcan::{self, filter::Mask32, Frame, TransmitStatus};
 use can_bit_timings::can_timings_bxcan;
-use nb::block;
 
 #[derive(Debug)]
 pub enum CANError {
@@ -50,12 +49,15 @@ where
         }
     }
 
-    pub fn transmit(&mut self, frame: &Frame) -> TransmitStatus {
-        block!(self.can_instance.transmit(frame)).unwrap()
+    pub fn transmit(&mut self, frame: &Frame) -> Result<TransmitStatus, CANError> {
+        self.can_instance
+            .transmit(frame)
+            .map_err(|_| -> CANError { CANError::Regular(ErrorKind::BufferOverrun) })
     }
 
     pub fn receive(&mut self) -> Result<Frame, CANError> {
-        self.can_instance.receive()
+        self.can_instance
+            .receive()
             .map_err(|_| -> CANError { CANError::Regular(ErrorKind::BufferOverrun) })
     }
 

@@ -7,6 +7,8 @@ use heapless;
 use hex;
 use packed_struct::prelude::*;
 
+use self::util::pad_left;
+
 #[derive(Debug)]
 pub enum SLCANError {
     Regular(ErrorKind),
@@ -136,7 +138,7 @@ impl SLCAN {
             timestamps_enabled: false,
             status: StatusFlags::new(),
             version: VersionInfo {
-                hardware_version: 0xFA,
+                hardware_version: 0x01,
                 software_version: 0x01,
             },
             serial_number: *b"F446",
@@ -227,7 +229,7 @@ impl SLCAN {
         if repr.len() >= available {
             return Err(SLCANError::Regular(ErrorKind::BufferOverrun));
         }
-        
+
         for byte in repr {
             tx_queue.push_back(byte).unwrap();
         }
@@ -353,8 +355,8 @@ impl Command {
             CommandVariant::SetupWithBTR => self.run_not_implemented(slcan),
             CommandVariant::OpenChannel => self.run_open_channel(slcan, canbus),
             CommandVariant::CloseChannel => self.run_close_channel(slcan, canbus),
-            CommandVariant::TransmitFrame => self.run_transmit_frame(slcan),
-            CommandVariant::TransmitExtendedFrame => self.run_transmit_extended_frame(slcan),
+            CommandVariant::TransmitFrame => self.run_transmit_frame(slcan, canbus),
+            CommandVariant::TransmitExtendedFrame => self.run_transmit_extended_frame(slcan, canbus),
             CommandVariant::TransmitRTRFrame => self.run_not_implemented(slcan),
             CommandVariant::TransmitExtendedRTRFrame => self.run_not_implemented(slcan),
             CommandVariant::ReadStatusFlags => self.run_read_status_flags(slcan),
@@ -413,7 +415,10 @@ impl Command {
         Ok(ResponseData::new())
     }
 
-    fn run_transmit_frame(&self, _slcan: &mut SLCAN) -> CommandReturnType {
+    fn run_transmit_frame<I>(&self, _slcan: &mut SLCAN, canbus: &mut CANBus<I>) -> CommandReturnType
+    where
+        I: bxcan::FilterOwner,
+    {
         // transmit a frame
         // frame must have minimum 4 bytes
         if self.data.len() < 4 {
@@ -421,57 +426,70 @@ impl Command {
         }
 
         let mut id = [0u8; 2];
-        hex::decode_to_slice(&self.data[1..4], &mut id).map_err(err_invalid_command)?;
+        let padded_slice: [u8; 4] = pad_left(&self.data[0..3]).unwrap();
+
+        hex::decode_to_slice(&padded_slice, &mut id).map_err(err_invalid_command)?;
         let id = bxcan::StandardId::new(u16::from_be_bytes(id))
             .ok_or(SLCANError::Regular(ErrorKind::InvalidCommand))?;
 
         let mut data_len = [0u8; 1];
-        hex::decode_to_slice(&self.data[4..5], &mut data_len).map_err(err_invalid_command)?;
+        let padded_slice: [u8; 2] = pad_left(&self.data[3..4]).unwrap();
+        hex::decode_to_slice(padded_slice, &mut data_len).map_err(err_invalid_command)?;
         let data_len: usize = u8::from_be_bytes(data_len).into();
 
         // ensure frame size is correct
-        let last_idx: usize = (4 + 2 * data_len).into();
-        if data_len > 8 || self.data.len() != last_idx {
+        let expected_len: usize = (4 + 2 * data_len).into();
+        if data_len > 8 || self.data.len() != expected_len {
             return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
         }
 
         let mut data = [0u8; 8];
-        hex::decode_to_slice(&self.data[5..last_idx], &mut data).map_err(err_invalid_command)?;
+        let padded_slice: [u8; 16] = pad_left(&self.data[4..]).unwrap();
+        hex::decode_to_slice(padded_slice, &mut data).map_err(err_invalid_command)?;
 
-        let frame = bxcan::Frame::new_data(id, bxcan::Data::new(&data[..data_len]).unwrap());
+        let frame = bxcan::Frame::new_data(id, bxcan::Data::new(&data[8 - data_len..]).unwrap());
 
-        let frame_bytes = SLCAN::can_frame_representation(&frame, true);
-        Ok(ResponseData::from_slice(frame_bytes.as_slice()).unwrap())
+        canbus.transmit(&frame).unwrap();
+        Ok(ResponseData::new())
     }
 
-    fn run_transmit_extended_frame(&self, _slcan: &mut SLCAN) -> CommandReturnType {
+    fn run_transmit_extended_frame<I>(
+        &self,
+        _slcan: &mut SLCAN,
+        canbus: &mut CANBus<I>,
+    ) -> CommandReturnType
+    where
+        I: bxcan::FilterOwner,
+    {
         // transmit an extended frame
         // frame must have minimum 9 bytes
         if self.data.len() < 9 {
             return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
         }
         let mut id = [0u8; 4];
-        hex::decode_to_slice(&self.data[1..9], &mut id).map_err(err_invalid_command)?;
+        hex::decode_to_slice(&self.data[0..8], &mut id).map_err(err_invalid_command)?;
         let id = bxcan::ExtendedId::new(u32::from_be_bytes(id))
             .ok_or(SLCANError::Regular(ErrorKind::InvalidCommand))?;
 
         let mut data_len = [0u8; 1];
-        hex::decode_to_slice(&self.data[9..10], &mut data_len).map_err(err_invalid_command)?;
+        let padded_slice: [u8; 2] = pad_left(&self.data[8..9]).unwrap();
+        hex::decode_to_slice(padded_slice, &mut data_len).map_err(err_invalid_command)?;
         let data_len: usize = u8::from_be_bytes(data_len).into();
 
         // ensure frame size is correct
-        let last_idx: usize = (9 + 2 * data_len).into();
-        if data_len > 8 || self.data.len() != last_idx {
+        let expected_len: usize = (9 + 2 * data_len).into();
+        if data_len > 8 || self.data.len() != expected_len {
             return Err(SLCANError::Regular(ErrorKind::InvalidCommand));
         }
 
         let mut data = [0u8; 8];
-        hex::decode_to_slice(&self.data[10..last_idx], &mut data).map_err(err_invalid_command)?;
+        let padded_slice: [u8; 16] = pad_left(&self.data[9..]).unwrap();
+        hex::decode_to_slice(padded_slice, &mut data).map_err(err_invalid_command)?;
 
-        let frame = bxcan::Frame::new_data(id, bxcan::Data::new(&data[..data_len]).unwrap());
+        let frame = bxcan::Frame::new_data(id, bxcan::Data::new(&data[8 - data_len..]).unwrap());
 
-        let frame_bytes = SLCAN::can_frame_representation(&frame, true);
-        Ok(ResponseData::from_slice(frame_bytes.as_slice()).unwrap())
+        canbus.transmit(&frame).unwrap();
+        Ok(ResponseData::new())
     }
 
     fn run_read_status_flags(&self, slcan: &mut SLCAN) -> CommandReturnType {

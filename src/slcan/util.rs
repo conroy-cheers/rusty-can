@@ -8,3 +8,14 @@ pub fn concat<T: Copy + Default, const A: usize, const B: usize>(
     two.copy_from_slice(b);
     whole
 }
+
+pub fn pad_left<const N: usize>(a: &[u8]) -> Result<[u8; N], ()> {
+    if a.len() > N {
+        return Err(());
+    }
+    let start_idx = N - a.len();
+
+    let mut arr = [b'0'; N];
+    arr[start_idx..].copy_from_slice(a);
+    Ok(arr)
+}
